@@ -86,6 +86,7 @@ func ResourceNetwork() *schema.Resource {
 		// controller 400.
 		CustomizeDiff: customdiff.All(
 			customizeNetworkVPNClient,
+			customizeNetworkRemoteUserVPN,
 			customizeNetworkDHCPGuarding,
 			customizeNetworkDefaultGateway,
 		),
@@ -116,11 +117,13 @@ func ResourceNetwork() *schema.Resource {
 					"* `wan` - External network connection (WAN uplink)\n" +
 					"* `vlan-only` - VLAN network without DHCP services\n" +
 					"* `vpn-client` - Site-to-site VPN client connection (see the `vpn_type` and " +
-					"`wireguard_client_*` arguments to configure a WireGuard VPN client)",
+					"`wireguard_client_*` arguments to configure a WireGuard VPN client)\n" +
+					"* `remote-user-vpn` - VPN Server for remote users (Settings > VPN > Server in the " +
+					"controller). See `vpn_type`, `remote_vpn_subnets` and the `uid_vpn_*` arguments",
 				Type:         schema.TypeString,
 				Required:     true,
 				ForceNew:     true,
-				ValidateFunc: validation.StringInSlice([]string{"corporate", "guest", "wan", "vlan-only", "vpn-client"}, false),
+				ValidateFunc: validation.StringInSlice([]string{"corporate", "guest", "wan", "vlan-only", "vpn-client", "remote-user-vpn"}, false),
 			},
 			"vlan_id": {
 				Description: "The VLAN ID for this network. Valid range is 0-4096. Common uses:\n" +
@@ -723,13 +726,16 @@ func ResourceNetwork() *schema.Resource {
 				ValidateFunc: validation.IntBetween(1, 128),
 			},
 			"vpn_type": {
-				Description: "The VPN type for a `vpn-client` network. Currently `wireguard-client` is supported, " +
-					"which connects the gateway to a remote WireGuard server. Only applicable when `purpose` is " +
-					"'vpn-client'. A `wireguard-client` network also requires `subnet` (the tunnel interface address, " +
-					"e.g. `10.0.0.2/32`) and `dhcp_dns` (interface DNS); the controller rejects the create without them.",
+				Description: "The VPN type. Two values are supported, one per VPN `purpose`:\n" +
+					"* `wireguard-client` - with `purpose` 'vpn-client', connects the gateway to a remote " +
+					"WireGuard server. Also requires `subnet` (the tunnel interface address, e.g. " +
+					"`10.0.0.2/32`) and `dhcp_dns` (interface DNS); the controller rejects the create without them.\n" +
+					"* `wireguard-server` - with `purpose` 'remote-user-vpn', runs a WireGuard VPN Server for " +
+					"remote users. Also requires `subnet` (the server's own tunnel address) and " +
+					"`remote_vpn_subnets` (the pool handed to clients).",
 				Type:         schema.TypeString,
 				Optional:     true,
-				ValidateFunc: validation.StringInSlice([]string{"wireguard-client"}, false),
+				ValidateFunc: validation.StringInSlice([]string{"wireguard-client", "wireguard-server"}, false),
 			},
 			"wireguard_interface": {
 				Description: "The WAN interface the WireGuard tunnel egresses from. One of `wan` or `wan2`. " +
@@ -824,6 +830,58 @@ func ResourceNetwork() *schema.Resource {
 					DiffSuppressFunc: utils.CidrDiffSuppress,
 				},
 			},
+			"remote_vpn_subnets": {
+				Description: "The address pool(s), in CIDR notation, handed out to remote VPN users. " +
+					"Only applicable when `purpose` is 'remote-user-vpn'. Ignored when " +
+					"`remote_vpn_dynamic_subnets_enabled` is true.",
+				Type:     schema.TypeList,
+				Optional: true,
+				Computed: true,
+				Elem: &schema.Schema{
+					Type:             schema.TypeString,
+					ValidateFunc:     utils.CidrValidate,
+					DiffSuppressFunc: utils.CidrDiffSuppress,
+				},
+			},
+			"remote_vpn_dynamic_subnets_enabled": {
+				Description: "When true, the controller allocates the remote-user address pool automatically " +
+					"instead of using `remote_vpn_subnets`. Only applicable when `purpose` is 'remote-user-vpn'.",
+				Type:     schema.TypeBool,
+				Optional: true,
+			},
+			"uid_vpn_type": {
+				Description: "The server implementation backing a `remote-user-vpn` network: `wireguard` or " +
+					"`openvpn`. Only applicable when `purpose` is 'remote-user-vpn'.",
+				Type:         schema.TypeString,
+				Optional:     true,
+				Computed:     true,
+				ValidateFunc: validation.StringInSlice([]string{"wireguard", "openvpn"}, false),
+			},
+			"uid_vpn_masquerade_enabled": {
+				Description: "When true, NAT remote-user VPN traffic to the gateway's address. " +
+					"Only applicable when `purpose` is 'remote-user-vpn'.",
+				Type:     schema.TypeBool,
+				Optional: true,
+			},
+			"uid_vpn_max_connection_time_seconds": {
+				Description: "Maximum lifetime of a remote-user VPN connection, in seconds. Omit for no limit. " +
+					"Only applicable when `purpose` is 'remote-user-vpn'.",
+				Type:         schema.TypeInt,
+				Optional:     true,
+				ValidateFunc: validation.IntAtLeast(1),
+			},
+			"uid_vpn_default_dns_suffix": {
+				Description: "The DNS search domain pushed to remote VPN users. " +
+					"Only applicable when `purpose` is 'remote-user-vpn'.",
+				Type:     schema.TypeString,
+				Optional: true,
+			},
+			"uid_vpn_sync_public_ip": {
+				Description: "When true, the controller keeps the VPN Server endpoint in sync with the WAN's " +
+					"public IP. Only applicable when `purpose` is 'remote-user-vpn'.",
+				Type:     schema.TypeBool,
+				Optional: true,
+			},
 		},
 	}
 }
@@ -903,6 +961,13 @@ func resourceNetworkGetResourceData(d *schema.ResourceData) (*unifi.Network, err
 	// values stay consistent (matches the diff suppression on the schema).
 	uidVPNCustomRouting = utils.CidrListZeroBased(uidVPNCustomRouting)
 
+	remoteVPNSubnetsRaw, _ := d.Get("remote_vpn_subnets").([]interface{})
+	remoteVPNSubnets, err := utils.ListToStringSlice(remoteVPNSubnetsRaw)
+	if err != nil {
+		return nil, fmt.Errorf("unable to convert remote_vpn_subnets to string slice: %w", err)
+	}
+	remoteVPNSubnets = utils.CidrListZeroBased(remoteVPNSubnets)
+
 	vpnType, _ := d.Get("vpn_type").(string)
 
 	// For a LAN the `subnet` is the gateway address, so CidrOneBased applies the +1
@@ -949,6 +1014,7 @@ func resourceNetworkGetResourceData(d *schema.ResourceData) (*unifi.Network, err
 
 		VPNType:             vpnType,
 		UidVPNCustomRouting: uidVPNCustomRouting,
+		RemoteVPNSubnets:    remoteVPNSubnets,
 	}
 
 	n.Name, _ = d.Get("name").(string)
@@ -1023,6 +1089,12 @@ func resourceNetworkGetResourceData(d *schema.ResourceData) (*unifi.Network, err
 	n.XWireguardPrivateKey, _ = d.Get("x_wireguard_private_key").(string)
 	n.VPNClientDefaultRoute, _ = d.Get("vpn_client_default_route").(bool)
 	n.VPNClientPullDNS, _ = d.Get("vpn_client_pull_dns").(bool)
+	n.RemoteVPNDynamicSubnetsEnabled, _ = d.Get("remote_vpn_dynamic_subnets_enabled").(bool)
+	n.UidVPNType, _ = d.Get("uid_vpn_type").(string)
+	n.UidVPNMasqueradeEnabled, _ = d.Get("uid_vpn_masquerade_enabled").(bool)
+	n.UidVPNMaxConnectionTimeSeconds, _ = d.Get("uid_vpn_max_connection_time_seconds").(int)
+	n.UidVPNDefaultDNSSuffix, _ = d.Get("uid_vpn_default_dns_suffix").(string)
+	n.UidVPNSyncPublicIP, _ = d.Get("uid_vpn_sync_public_ip").(bool)
 
 	// Zone-Based Firewall (UniFi OS 9.x) zone membership. Only send firewall_zone_id
 	// when the user explicitly configured it. If it is omitted (null/unknown) leave it
@@ -1050,8 +1122,11 @@ func customizeNetworkVPNClient(_ context.Context, d *schema.ResourceDiff, _ inte
 	}
 
 	// Every field that only belongs on a vpn-client network.
+	// NOTE: "vpn_type" is deliberately absent. It is shared with the
+	// remote-user-vpn purpose ("wireguard-server"), so it is validated against
+	// purpose below rather than rejected outright here.
 	vpnFields := []string{
-		"vpn_type", "wireguard_interface", "wireguard_client_mode",
+		"wireguard_interface", "wireguard_client_mode",
 		"wireguard_client_peer_ip", "wireguard_client_peer_public_key",
 		"x_wireguard_private_key", "wireguard_client_preshared_key",
 		"wireguard_client_peer_port", "uid_vpn_custom_routing",
@@ -1092,6 +1167,94 @@ func customizeNetworkVPNClient(_ context.Context, d *schema.ResourceDiff, _ inte
 		if !utils.IsRawConfigSet(raw, k) {
 			return fmt.Errorf("%q is required when vpn_type = %q", k, "wireguard-client")
 		}
+	}
+	return nil
+}
+
+// customizeNetworkRemoteUserVPN enforces the cross-field rules for remote-user-vpn
+// (VPN Server) networks at plan time, mirroring customizeNetworkVPNClient.
+func customizeNetworkRemoteUserVPN(_ context.Context, d *schema.ResourceDiff, _ interface{}) error {
+	return validateRemoteUserVPNRawConfig(d.GetRawConfig())
+}
+
+// validateRemoteUserVPNRawConfig holds the pure raw-config logic so it is
+// unit-testable without constructing a ResourceDiff — the same split, and for the
+// same reason, as validateDHCPGuardingRawConfig.
+//
+// Everything is read from the raw config rather than d.Get because presence is the
+// question being asked: a field supplied through interpolation is unknown at plan
+// but is still set, and an Optional+Computed field reads back empty from a
+// ResourceDiff even when it is inheriting a prior value.
+//
+// This function also owns BOTH directions of the vpn_type/purpose pairing.
+// vpn_type is shared between the two VPN purposes, so neither validator can
+// reject it outright; keeping both rules here keeps them in one place instead of
+// splitting one invariant across two functions.
+func validateRemoteUserVPNRawConfig(raw cty.Value) error {
+	if raw.IsNull() || !raw.IsKnown() {
+		return nil // no config (e.g. on destroy) — nothing to validate
+	}
+
+	str := func(k string) string {
+		if !raw.Type().HasAttribute(k) {
+			return ""
+		}
+		v := raw.GetAttr(k)
+		if v.IsNull() || !v.IsKnown() || v.Type() != cty.String {
+			return ""
+		}
+		return v.AsString()
+	}
+	boolean := func(k string) bool {
+		if !raw.Type().HasAttribute(k) {
+			return false
+		}
+		v := raw.GetAttr(k)
+		if v.IsNull() || !v.IsKnown() || v.Type() != cty.Bool {
+			return false
+		}
+		return v.True()
+	}
+
+	// Every field that only belongs on a remote-user-vpn network.
+	serverFields := []string{
+		"remote_vpn_subnets", "remote_vpn_dynamic_subnets_enabled",
+		"uid_vpn_type", "uid_vpn_masquerade_enabled",
+		"uid_vpn_max_connection_time_seconds", "uid_vpn_default_dns_suffix",
+		"uid_vpn_sync_public_ip",
+	}
+
+	purpose := str("purpose")
+	vpnType := str("vpn_type")
+
+	if purpose != "remote-user-vpn" {
+		for _, k := range serverFields {
+			if utils.IsRawConfigSet(raw, k) {
+				return fmt.Errorf("%q is only valid when purpose = %q", k, "remote-user-vpn")
+			}
+		}
+		if vpnType == "wireguard-server" {
+			return fmt.Errorf("vpn_type %q is only valid when purpose = %q", "wireguard-server", "remote-user-vpn")
+		}
+		return nil
+	}
+
+	if vpnType == "wireguard-client" {
+		return fmt.Errorf("vpn_type %q is only valid when purpose = %q", "wireguard-client", "vpn-client")
+	}
+	// Only the WireGuard server is modelled. OpenVPN/L2TP servers use a different
+	// set of controller fields that this resource does not expose, so accepting
+	// them here would produce a create the controller rejects.
+	if vpnType != "wireguard-server" {
+		return fmt.Errorf("%q is required when purpose = %q (only %q is supported)", "vpn_type", "remote-user-vpn", "wireguard-server")
+	}
+	if !utils.IsRawConfigSet(raw, "subnet") {
+		return fmt.Errorf("%q (the VPN Server's own tunnel address) is required for a remote-user-vpn network", "subnet")
+	}
+	// The client address pool is either explicit or controller-allocated, never
+	// neither: with both absent the controller has nothing to hand out.
+	if !boolean("remote_vpn_dynamic_subnets_enabled") && !utils.IsRawConfigSet(raw, "remote_vpn_subnets") {
+		return fmt.Errorf("%q is required when %q is false", "remote_vpn_subnets", "remote_vpn_dynamic_subnets_enabled")
 	}
 	return nil
 }
@@ -1398,6 +1561,14 @@ func resourceNetworkSetResourceData(resp *unifi.Network, d *schema.ResourceData,
 		"vpn_client_default_route":               resp.VPNClientDefaultRoute,
 		"vpn_client_pull_dns":                    resp.VPNClientPullDNS,
 		"uid_vpn_custom_routing":                 utils.CidrListZeroBased(resp.UidVPNCustomRouting),
+
+		"remote_vpn_subnets":                  utils.CidrListZeroBased(resp.RemoteVPNSubnets),
+		"remote_vpn_dynamic_subnets_enabled":  resp.RemoteVPNDynamicSubnetsEnabled,
+		"uid_vpn_type":                        resp.UidVPNType,
+		"uid_vpn_masquerade_enabled":          resp.UidVPNMasqueradeEnabled,
+		"uid_vpn_max_connection_time_seconds": resp.UidVPNMaxConnectionTimeSeconds,
+		"uid_vpn_default_dns_suffix":          resp.UidVPNDefaultDNSSuffix,
+		"uid_vpn_sync_public_ip":              resp.UidVPNSyncPublicIP,
 	}
 
 	// Write-only secrets: the controller may omit these on read. Only overwrite state when a

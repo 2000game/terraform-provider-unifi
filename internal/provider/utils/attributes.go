@@ -29,6 +29,16 @@ func IsRawConfigSet(raw cty.Value, name string) bool {
 		return v.AsString() != ""
 	case v.Type() == cty.Number:
 		return !v.RawEquals(cty.Zero)
+	case v.Type() == cty.Bool:
+		// Reached only for a non-null, known bool, i.e. one the user actually
+		// wrote. Unlike "" or 0, `false` is not indistinguishable from absent
+		// here -- the raw config represents absent as null -- so an explicit
+		// `false` counts as set, and a caller asking "is this attribute valid
+		// on this resource?" gets the right answer for it.
+		//
+		// Without this case a bool fell through to LengthInt(), which panics on
+		// a non-collection.
+		return true
 	default: // list / set / tuple / map
 		return v.LengthInt() > 0
 	}
