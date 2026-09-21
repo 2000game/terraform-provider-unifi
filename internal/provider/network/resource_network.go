@@ -1134,8 +1134,32 @@ func resourceNetworkGetResourceData(d *schema.ResourceData) (*unifi.Network, err
 // interpolation (e.g. var.x, unknown at plan) counts as set instead of tripping a
 // false "required" error.
 func customizeNetworkVPNClient(_ context.Context, d *schema.ResourceDiff, _ interface{}) error {
-	raw := d.GetRawConfig()
-	if raw.IsNull() {
+	return validateVPNClientRawConfig(d.GetRawConfig())
+}
+
+// rawKnownString reads name from a raw config as a string, and reports whether it
+// can be read at all right now. An interpolated value (e.g. var.x) is set but
+// unknown at plan time, so a rule that compares against a *value* must defer
+// rather than read it as "" — the schema's own validation still applies at apply.
+func rawKnownString(raw cty.Value, name string) (string, bool) {
+	if raw.IsNull() || !raw.IsKnown() || !raw.Type().HasAttribute(name) {
+		return "", false
+	}
+	v := raw.GetAttr(name)
+	if v.IsNull() || !v.IsKnown() || v.Type() != cty.String {
+		return "", false
+	}
+	return v.AsString(), true
+}
+
+// validateVPNClientRawConfig holds the pure raw-config logic so it is
+// unit-testable without constructing a ResourceDiff — the same split, and for the
+// same reason, as validateDHCPGuardingRawConfig. Presence is read from the raw
+// config so a field supplied through interpolation counts as set instead of
+// tripping a false "required" error. None of the attributes read here are
+// Computed, so the raw config is the whole truth for them.
+func validateVPNClientRawConfig(raw cty.Value) error {
+	if raw.IsNull() || !raw.IsKnown() {
 		return nil // no config (e.g. on destroy) — nothing to validate
 	}
 
@@ -1153,7 +1177,15 @@ func customizeNetworkVPNClient(_ context.Context, d *schema.ResourceDiff, _ inte
 		"wireguard_client_peer_port", "uid_vpn_custom_routing",
 	}
 
-	purpose, _ := d.Get("purpose").(string)
+	// Every rule below is keyed on purpose, so an interpolated purpose makes none
+	// of them decidable at plan time. Defer rather than read it as "", which
+	// reads as "not vpn-client" and would reject the very fields such a config
+	// legitimately carries.
+	purpose, purposeKnown := rawKnownString(raw, "purpose")
+	if !purposeKnown {
+		return nil
+	}
+
 	if purpose != "vpn-client" {
 		for _, k := range vpnFields {
 			if utils.IsRawConfigSet(raw, k) {
@@ -1163,8 +1195,13 @@ func customizeNetworkVPNClient(_ context.Context, d *schema.ResourceDiff, _ inte
 		return validateWireguardFieldPurposes(raw, purpose)
 	}
 
-	vpnType, _ := d.Get("vpn_type").(string)
-	if vpnType != "wireguard-client" {
+	vpnType, vpnTypeKnown := rawKnownString(raw, "vpn_type")
+	switch {
+	case !utils.IsRawConfigSet(raw, "vpn_type"):
+		return fmt.Errorf("%q is required when purpose = %q (only %q is supported)", "vpn_type", "vpn-client", "wireguard-client")
+	case !vpnTypeKnown:
+		// Interpolated: set, but not comparable until apply.
+	case vpnType != "wireguard-client":
 		return fmt.Errorf("%q is required when purpose = %q (only %q is supported)", "vpn_type", "vpn-client", "wireguard-client")
 	}
 	if !utils.IsRawConfigSet(raw, "subnet") {
@@ -1172,7 +1209,7 @@ func customizeNetworkVPNClient(_ context.Context, d *schema.ResourceDiff, _ inte
 	}
 	// The tunnel address must be a /32 host address: CidrZeroBased zeroes the host
 	// bits below /32, silently corrupting a shorter prefix. Skip when unknown.
-	if subnet, _ := d.Get("subnet").(string); subnet != "" {
+	if subnet, known := rawKnownString(raw, "subnet"); known && subnet != "" {
 		ip, ipNet, err := net.ParseCIDR(subnet)
 		if err != nil || ip.To4() == nil {
 			return fmt.Errorf("%q must be an IPv4 CIDR for a wireguard-client network", "subnet")
@@ -1241,17 +1278,7 @@ func validateRemoteUserVPNRawConfig(raw cty.Value) error {
 		}
 		return raw.GetAttr(k)
 	}
-	// str returns k's configured string and whether that string can be *read*
-	// now. An interpolated value is set but unknown at plan time, so a rule that
-	// compares against a value must defer instead of reading it as "" — the
-	// schema enum still constrains it at apply.
-	str := func(k string) (string, bool) {
-		v := attr(k)
-		if v == cty.NilVal || v.IsNull() || !v.IsKnown() || v.Type() != cty.String {
-			return "", false
-		}
-		return v.AsString(), true
-	}
+	str := func(k string) (string, bool) { return rawKnownString(raw, k) }
 	// boolVal returns k's configured value and whether it can be evaluated now.
 	// An omitted bool evaluates to false (its zero value), but an interpolated
 	// one cannot be evaluated at all: a rule keyed on it must defer rather than

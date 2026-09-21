@@ -273,3 +273,105 @@ func TestValidateRemoteUserVPNRawConfig_unknownPurpose(t *testing.T) {
 		"subnet":   cty.StringVal("192.168.3.1/24"),
 	})))
 }
+
+// clientRaw builds a raw config for a vpn-client network, complete enough that
+// every "required" rule is satisfied, so a case can isolate one attribute.
+func clientRaw(attrs map[string]cty.Value) cty.Value {
+	base := map[string]cty.Value{
+		"purpose":                          cty.StringVal("vpn-client"),
+		"vpn_type":                         cty.StringVal("wireguard-client"),
+		"subnet":                           cty.StringVal("10.0.0.2/32"),
+		"dhcp_dns":                         cty.ListVal([]cty.Value{cty.StringVal("1.1.1.1")}),
+		"wireguard_client_peer_ip":         cty.StringVal("198.51.100.1"),
+		"wireguard_client_peer_public_key": cty.StringVal("Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm8="),
+		"wireguard_client_peer_port":       cty.NumberIntVal(51820),
+	}
+	for k, v := range attrs {
+		if v == cty.NilVal {
+			delete(base, k)
+			continue
+		}
+		base[k] = v
+	}
+	return cty.ObjectVal(base)
+}
+
+func TestValidateVPNClientRawConfig_valid(t *testing.T) {
+	wantOK(t, validateVPNClientRawConfig(clientRaw(nil)))
+}
+
+func TestValidateVPNClientRawConfig_nullConfig(t *testing.T) {
+	wantOK(t, validateVPNClientRawConfig(cty.NullVal(cty.EmptyObject)))
+}
+
+// The pre-existing vpn-client rules must keep firing.
+func TestValidateVPNClientRawConfig_requiredFields(t *testing.T) {
+	wantErr(t, validateVPNClientRawConfig(clientRaw(map[string]cty.Value{"subnet": cty.NilVal})),
+		`"subnet" (the tunnel interface address`)
+	wantErr(t, validateVPNClientRawConfig(clientRaw(map[string]cty.Value{"dhcp_dns": cty.NilVal})),
+		`"dhcp_dns" (interface DNS) is required`)
+	wantErr(t, validateVPNClientRawConfig(clientRaw(map[string]cty.Value{"wireguard_client_peer_ip": cty.NilVal})),
+		`"wireguard_client_peer_ip" is required`)
+	wantErr(t, validateVPNClientRawConfig(clientRaw(map[string]cty.Value{"subnet": cty.StringVal("10.0.0.0/24")})),
+		`must be a /32 tunnel interface address`)
+	wantErr(t, validateVPNClientRawConfig(cty.ObjectVal(map[string]cty.Value{
+		"purpose":                  cty.StringVal("corporate"),
+		"wireguard_client_peer_ip": cty.StringVal("198.51.100.1"),
+	})), `"wireguard_client_peer_ip" is only valid when purpose = "vpn-client"`)
+}
+
+// Every rule is keyed on purpose, so an interpolated purpose makes none of them
+// decidable. d.Get read an unknown purpose as "", which reads as "not
+// vpn-client" and rejected the very fields the config legitimately carries.
+func TestValidateVPNClientRawConfig_unknownPurpose(t *testing.T) {
+	wantOK(t, validateVPNClientRawConfig(cty.ObjectVal(map[string]cty.Value{
+		"purpose":                 cty.UnknownVal(cty.String),
+		"wireguard_interface":     cty.StringVal("wan"),
+		"x_wireguard_private_key": cty.StringVal("Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm8="),
+	})))
+	// ...including the vpn-client-only fields, which behaved the same way before.
+	wantOK(t, validateVPNClientRawConfig(cty.ObjectVal(map[string]cty.Value{
+		"purpose":                  cty.UnknownVal(cty.String),
+		"wireguard_client_peer_ip": cty.StringVal("198.51.100.1"),
+	})))
+}
+
+// An interpolated vpn_type is set but not comparable at plan time.
+func TestValidateVPNClientRawConfig_unknownVPNType(t *testing.T) {
+	wantOK(t, validateVPNClientRawConfig(clientRaw(map[string]cty.Value{
+		"vpn_type": cty.UnknownVal(cty.String),
+	})))
+	// An interpolated subnet cannot be parsed for the /32 rule either.
+	wantOK(t, validateVPNClientRawConfig(clientRaw(map[string]cty.Value{
+		"subnet": cty.UnknownVal(cty.String),
+	})))
+}
+
+func TestRawKnownString(t *testing.T) {
+	raw := cty.ObjectVal(map[string]cty.Value{
+		"set":     cty.StringVal("v"),
+		"empty":   cty.StringVal(""),
+		"null":    cty.NullVal(cty.String),
+		"unknown": cty.UnknownVal(cty.String),
+		"notStr":  cty.True,
+	})
+	for _, tc := range []struct {
+		name, want string
+		wantKnown  bool
+	}{
+		{"set", "v", true},
+		{"empty", "", true},
+		{"null", "", false},
+		{"unknown", "", false},
+		{"notStr", "", false},
+		{"missing", "", false},
+	} {
+		got, known := rawKnownString(raw, tc.name)
+		if got != tc.want || known != tc.wantKnown {
+			t.Errorf("rawKnownString(%q) = (%q, %v), want (%q, %v)", tc.name, got, known, tc.want, tc.wantKnown)
+		}
+	}
+	if _, known := rawKnownString(cty.NullVal(cty.EmptyObject), "x"); known {
+		t.Error("a null raw config has no readable attributes")
+	}
+}
