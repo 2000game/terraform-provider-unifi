@@ -311,11 +311,11 @@ This attribute is `Optional` + `Computed`: when omitted from configuration it in
 - `site` (String) The name of the site to associate the network with.
 - `subnet` (String) The IPv4 subnet for this network in CIDR notation (e.g., '192.168.1.0/24'). This defines the network's address space and determines the range of IP addresses available for DHCP.
 - `uid_vpn_custom_routing` (List of String) The list of destination subnets (CIDR notation) routed through the VPN client tunnel when `vpn_client_default_route` is false. Values are canonicalized to their network address (e.g. `10.0.0.1/16` becomes `10.0.0.0/16`). Only applicable when `purpose` is 'vpn-client'.
-- `uid_vpn_default_dns_suffix` (String) The DNS search domain pushed to remote VPN users. Only applicable when `purpose` is 'remote-user-vpn'.
+- `uid_vpn_default_dns_suffix` (String) The DNS search domain pushed to remote VPN users. Only applicable when `purpose` is 'remote-user-vpn'. Computed for the same reason as `uid_vpn_max_connection_time_seconds`: an omitted value inherits rather than clears.
 - `uid_vpn_masquerade_enabled` (Boolean) When true, NAT remote-user VPN traffic to the gateway's address. Only applicable when `purpose` is 'remote-user-vpn'.
-- `uid_vpn_max_connection_time_seconds` (Number) Maximum lifetime of a remote-user VPN connection, in seconds. Omit for no limit. Only applicable when `purpose` is 'remote-user-vpn'.
+- `uid_vpn_max_connection_time_seconds` (Number) Maximum lifetime of a remote-user VPN connection, in seconds. Only applicable when `purpose` is 'remote-user-vpn'. Computed: the controller's value is inherited when this is omitted, because the underlying field is dropped from the payload when empty and so cannot be cleared by omission.
 - `uid_vpn_sync_public_ip` (Boolean) When true, the controller keeps the VPN Server endpoint in sync with the WAN's public IP. Only applicable when `purpose` is 'remote-user-vpn'.
-- `uid_vpn_type` (String) The server implementation backing a `remote-user-vpn` network: `wireguard` or `openvpn`. Only applicable when `purpose` is 'remote-user-vpn'.
+- `uid_vpn_type` (String) The server implementation backing a `remote-user-vpn` network. Must be `wireguard`, matching `vpn_type` = 'wireguard-server' — the controller's `openvpn` value is not modelled by this resource. Only applicable when `purpose` is 'remote-user-vpn'.
 - `upnp_lan_enabled` (Boolean) Whether clients on THIS network are allowed to request UPnP/NAT-PMP port mappings. Per-network opt-in that complements the gateway-global UPnP toggle (`unifi_setting_usg.upnp_enabled`): UPnP must be enabled globally AND on a given network for that network's devices to self-map WAN ports. Leave false on untrusted networks (IoT, Guest, …) so a compromised device cannot open inbound holes in the firewall; enable only on networks whose devices you trust to manage their own port mappings.
 - `vlan_id` (Number) The VLAN ID for this network. Valid range is 0-4096. Common uses:
 * 1-4094: Standard VLAN range for network segmentation
@@ -380,17 +380,17 @@ Choose based on your ISP's requirements.
 - `wireguard_client_peer_public_key` (String) The remote WireGuard server's public key (the peer the gateway connects to). Only applicable when `vpn_type` is 'wireguard-client'.
 - `wireguard_client_preshared_key` (String, Sensitive) An optional WireGuard pre-shared key (PSK) for an additional layer of symmetric-key security with the peer. Keep this value secret. The controller may not return this value on read, so it is computed to avoid spurious drift. Only applicable when `vpn_type` is 'wireguard-client'.
 - `wireguard_client_preshared_key_enabled` (Boolean) Whether a WireGuard pre-shared key is used with the peer. Only applicable when `vpn_type` is 'wireguard-client'.
-- `wireguard_interface` (String) The WAN interface the WireGuard tunnel egresses from. One of `wan` or `wan2`. Only applicable when `vpn_type` is 'wireguard-client'.
+- `wireguard_interface` (String) The WAN interface the WireGuard tunnel egresses from. One of `wan` or `wan2`. Only applicable when `vpn_type` is 'wireguard-client' or 'wireguard-server'.
 - `x_wan_password` (String) Password for WAN authentication.
 * Required for PPPoE connections
 * May be needed for some ISP configurations
 * Must be kept secret
-- `x_wireguard_private_key` (String, Sensitive) The gateway's own WireGuard private key for this VPN client. If omitted, a key pair is generated for you and the public key is exposed via `wireguard_public_key`. Keep this value secret. Only applicable when `vpn_type` is 'wireguard-client'.
+- `x_wireguard_private_key` (String, Sensitive) The gateway's own WireGuard private key for this network. If omitted, a key pair is generated for you and the public key is exposed via `wireguard_public_key`. Keep this value secret. Only applicable when `vpn_type` is 'wireguard-client' or 'wireguard-server'.
 
 ### Read-Only
 
 - `id` (String) The ID of the network.
-- `wireguard_public_key` (String) The gateway's own WireGuard public key for this VPN client. The controller does not return it, so the provider derives it from the private key (Curve25519). Add this key as a peer on the remote WireGuard server. Only set when `vpn_type` is 'wireguard-client'.
+- `wireguard_public_key` (String) The gateway's own WireGuard public key for this network. The controller does not return it, so the provider derives it from the private key (Curve25519). For a 'wireguard-client' network, add this key as a peer on the remote WireGuard server. Only set when `vpn_type` is 'wireguard-client' or 'wireguard-server'.
 
 ## Import
 

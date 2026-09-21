@@ -739,7 +739,7 @@ func ResourceNetwork() *schema.Resource {
 			},
 			"wireguard_interface": {
 				Description: "The WAN interface the WireGuard tunnel egresses from. One of `wan` or `wan2`. " +
-					"Only applicable when `vpn_type` is 'wireguard-client'.",
+					"Only applicable when `vpn_type` is 'wireguard-client' or 'wireguard-server'.",
 				Type:         schema.TypeString,
 				Optional:     true,
 				ValidateFunc: validation.StringInSlice([]string{"wan", "wan2"}, false),
@@ -789,9 +789,9 @@ func ResourceNetwork() *schema.Resource {
 				Optional: true,
 			},
 			"x_wireguard_private_key": {
-				Description: "The gateway's own WireGuard private key for this VPN client. If omitted, a key pair is " +
+				Description: "The gateway's own WireGuard private key for this network. If omitted, a key pair is " +
 					"generated for you and the public key is exposed via `wireguard_public_key`. Keep this value secret. " +
-					"Only applicable when `vpn_type` is 'wireguard-client'.",
+					"Only applicable when `vpn_type` is 'wireguard-client' or 'wireguard-server'.",
 				Type:         schema.TypeString,
 				Optional:     true,
 				Computed:     true,
@@ -799,9 +799,10 @@ func ResourceNetwork() *schema.Resource {
 				ValidateFunc: utils.WireguardKeyValidate,
 			},
 			"wireguard_public_key": {
-				Description: "The gateway's own WireGuard public key for this VPN client. The controller does not " +
-					"return it, so the provider derives it from the private key (Curve25519). Add this key as a peer " +
-					"on the remote WireGuard server. Only set when `vpn_type` is 'wireguard-client'.",
+				Description: "The gateway's own WireGuard public key for this network. The controller does not " +
+					"return it, so the provider derives it from the private key (Curve25519). For a " +
+					"'wireguard-client' network, add this key as a peer on the remote WireGuard server. " +
+					"Only set when `vpn_type` is 'wireguard-client' or 'wireguard-server'.",
 				Type:     schema.TypeString,
 				Computed: true,
 			},
@@ -850,8 +851,10 @@ func ResourceNetwork() *schema.Resource {
 				Optional: true,
 			},
 			"uid_vpn_type": {
-				Description: "The server implementation backing a `remote-user-vpn` network: `wireguard` or " +
-					"`openvpn`. Only applicable when `purpose` is 'remote-user-vpn'.",
+				Description: "The server implementation backing a `remote-user-vpn` network. Must be " +
+					"`wireguard`, matching `vpn_type` = 'wireguard-server' — the controller's `openvpn` " +
+					"value is not modelled by this resource. Only applicable when `purpose` is " +
+					"'remote-user-vpn'.",
 				Type:         schema.TypeString,
 				Optional:     true,
 				Computed:     true,
@@ -864,17 +867,22 @@ func ResourceNetwork() *schema.Resource {
 				Optional: true,
 			},
 			"uid_vpn_max_connection_time_seconds": {
-				Description: "Maximum lifetime of a remote-user VPN connection, in seconds. Omit for no limit. " +
-					"Only applicable when `purpose` is 'remote-user-vpn'.",
+				Description: "Maximum lifetime of a remote-user VPN connection, in seconds. " +
+					"Only applicable when `purpose` is 'remote-user-vpn'. Computed: the controller's " +
+					"value is inherited when this is omitted, because the underlying field is dropped " +
+					"from the payload when empty and so cannot be cleared by omission.",
 				Type:         schema.TypeInt,
 				Optional:     true,
+				Computed:     true,
 				ValidateFunc: validation.IntAtLeast(1),
 			},
 			"uid_vpn_default_dns_suffix": {
 				Description: "The DNS search domain pushed to remote VPN users. " +
-					"Only applicable when `purpose` is 'remote-user-vpn'.",
+					"Only applicable when `purpose` is 'remote-user-vpn'. Computed for the same reason " +
+					"as `uid_vpn_max_connection_time_seconds`: an omitted value inherits rather than clears.",
 				Type:     schema.TypeString,
 				Optional: true,
+				Computed: true,
 			},
 			"uid_vpn_sync_public_ip": {
 				Description: "When true, the controller keeps the VPN Server endpoint in sync with the WAN's " +
@@ -884,6 +892,15 @@ func ResourceNetwork() *schema.Resource {
 			},
 		},
 	}
+}
+
+// needsGeneratedWireguardKey reports whether the provider must mint a private key
+// for this create. See resourceNetworkCreate for why it happens there.
+func needsGeneratedWireguardKey(vpnType, privateKey string) bool {
+	if privateKey != "" {
+		return false
+	}
+	return vpnType == "wireguard-client" || vpnType == "wireguard-server"
 }
 
 func resourceNetworkCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
@@ -897,10 +914,11 @@ func resourceNetworkCreate(ctx context.Context, d *schema.ResourceData, meta int
 	// returns it on read, so generating it here rather than in the shared request
 	// builder avoids silently rotating an imported network's key on a later update
 	// (after import the key is empty in state; on update omitempty drops it and the
-	// controller keeps the one it already has).
+	// controller keeps the one it already has). Both WireGuard purposes need one:
+	// the server end of a tunnel has an identity just as the client end does.
 	vpnType, _ := d.Get("vpn_type").(string)
 	privateKey, _ := d.Get("x_wireguard_private_key").(string)
-	if vpnType == "wireguard-client" && privateKey == "" {
+	if needsGeneratedWireguardKey(vpnType, privateKey) {
 		key, err := generateWireguardPrivateKey()
 		if err != nil {
 			return diag.FromErr(fmt.Errorf("unable to generate WireGuard private key: %w", err))
@@ -1124,11 +1142,14 @@ func customizeNetworkVPNClient(_ context.Context, d *schema.ResourceDiff, _ inte
 	// Every field that only belongs on a vpn-client network.
 	// NOTE: "vpn_type" is deliberately absent. It is shared with the
 	// remote-user-vpn purpose ("wireguard-server"), so it is validated against
-	// purpose below rather than rejected outright here.
+	// purpose in validateRemoteUserVPNRawConfig, which owns both directions of
+	// that pairing. "wireguard_interface" and "x_wireguard_private_key" are
+	// likewise absent: both WireGuard purposes need them (see
+	// validateWireguardFieldPurposes).
 	vpnFields := []string{
-		"wireguard_interface", "wireguard_client_mode",
+		"wireguard_client_mode",
 		"wireguard_client_peer_ip", "wireguard_client_peer_public_key",
-		"x_wireguard_private_key", "wireguard_client_preshared_key",
+		"wireguard_client_preshared_key",
 		"wireguard_client_peer_port", "uid_vpn_custom_routing",
 	}
 
@@ -1139,7 +1160,7 @@ func customizeNetworkVPNClient(_ context.Context, d *schema.ResourceDiff, _ inte
 				return fmt.Errorf("%q is only valid when purpose = %q", k, "vpn-client")
 			}
 		}
-		return nil
+		return validateWireguardFieldPurposes(raw, purpose)
 	}
 
 	vpnType, _ := d.Get("vpn_type").(string)
@@ -1171,6 +1192,23 @@ func customizeNetworkVPNClient(_ context.Context, d *schema.ResourceDiff, _ inte
 	return nil
 }
 
+// validateWireguardFieldPurposes keeps the gateway's own WireGuard identity —
+// its private key and the WAN the tunnel egresses from — off networks that run no
+// WireGuard at all, while allowing it on both purposes that do. A VPN Server needs
+// a keypair exactly as a VPN client does; pinning these to vpn-client alone left a
+// remote-user-vpn network with no way to carry one.
+func validateWireguardFieldPurposes(raw cty.Value, purpose string) error {
+	if purpose == "vpn-client" || purpose == "remote-user-vpn" {
+		return nil
+	}
+	for _, k := range []string{"wireguard_interface", "x_wireguard_private_key"} {
+		if utils.IsRawConfigSet(raw, k) {
+			return fmt.Errorf("%q is only valid when purpose = %q or %q", k, "vpn-client", "remote-user-vpn")
+		}
+	}
+	return nil
+}
+
 // customizeNetworkRemoteUserVPN enforces the cross-field rules for remote-user-vpn
 // (VPN Server) networks at plan time, mirroring customizeNetworkVPNClient.
 func customizeNetworkRemoteUserVPN(_ context.Context, d *schema.ResourceDiff, _ interface{}) error {
@@ -1195,25 +1233,50 @@ func validateRemoteUserVPNRawConfig(raw cty.Value) error {
 		return nil // no config (e.g. on destroy) — nothing to validate
 	}
 
-	str := func(k string) string {
+	// attr returns the raw value for k, or cty.NilVal when the attribute is not
+	// part of the config's type at all (which a hand-built test object can be).
+	attr := func(k string) cty.Value {
 		if !raw.Type().HasAttribute(k) {
-			return ""
+			return cty.NilVal
 		}
-		v := raw.GetAttr(k)
-		if v.IsNull() || !v.IsKnown() || v.Type() != cty.String {
-			return ""
-		}
-		return v.AsString()
+		return raw.GetAttr(k)
 	}
-	boolean := func(k string) bool {
-		if !raw.Type().HasAttribute(k) {
+	// str returns k's configured string and whether that string can be *read*
+	// now. An interpolated value is set but unknown at plan time, so a rule that
+	// compares against a value must defer instead of reading it as "" — the
+	// schema enum still constrains it at apply.
+	str := func(k string) (string, bool) {
+		v := attr(k)
+		if v == cty.NilVal || v.IsNull() || !v.IsKnown() || v.Type() != cty.String {
+			return "", false
+		}
+		return v.AsString(), true
+	}
+	// boolVal returns k's configured value and whether it can be evaluated now.
+	// An omitted bool evaluates to false (its zero value), but an interpolated
+	// one cannot be evaluated at all: a rule keyed on it must defer rather than
+	// run against a wrong default.
+	boolVal := func(k string) (value, evaluable bool) {
+		v := attr(k)
+		if v == cty.NilVal || v.IsNull() {
+			return false, true
+		}
+		if !v.IsKnown() || v.Type() != cty.Bool {
+			return false, false
+		}
+		return v.True(), true
+	}
+	// setForPurpose reports whether k is configured in a way that contradicts the
+	// network's purpose. A known-`false` bool does not: passing every optional
+	// argument from a variable with a `false` default is the ordinary shape of a
+	// module, and `false` asks for nothing the purpose cannot give. (utils.
+	// IsRawConfigSet answers a different question — "did the user write this?" —
+	// for which an explicit `false` rightly counts.)
+	setForPurpose := func(k string) bool {
+		if v := attr(k); v != cty.NilVal && !v.IsNull() && v.IsKnown() && v.Type() == cty.Bool && v.False() {
 			return false
 		}
-		v := raw.GetAttr(k)
-		if v.IsNull() || !v.IsKnown() || v.Type() != cty.Bool {
-			return false
-		}
-		return v.True()
+		return utils.IsRawConfigSet(raw, k)
 	}
 
 	// Every field that only belongs on a remote-user-vpn network.
@@ -1224,37 +1287,68 @@ func validateRemoteUserVPNRawConfig(raw cty.Value) error {
 		"uid_vpn_sync_public_ip",
 	}
 
-	purpose := str("purpose")
-	vpnType := str("vpn_type")
+	purpose, purposeKnown := str("purpose")
+	vpnType, vpnTypeKnown := str("vpn_type")
+	vpnTypeSet := utils.IsRawConfigSet(raw, "vpn_type")
+
+	// Every rule here is keyed on purpose, so an interpolated purpose makes none
+	// of them decidable at plan time. Defer rather than read it as "" and reject
+	// a config that may well be a valid remote-user-vpn network.
+	if !purposeKnown {
+		return nil
+	}
 
 	if purpose != "remote-user-vpn" {
 		for _, k := range serverFields {
-			if utils.IsRawConfigSet(raw, k) {
+			if setForPurpose(k) {
 				return fmt.Errorf("%q is only valid when purpose = %q", k, "remote-user-vpn")
 			}
 		}
 		if vpnType == "wireguard-server" {
 			return fmt.Errorf("vpn_type %q is only valid when purpose = %q", "wireguard-server", "remote-user-vpn")
 		}
+		// vpn_type belongs to exactly two purposes, and vpn-client's own value is
+		// checked by customizeNetworkVPNClient. Rejecting it outright everywhere
+		// else is what keeps "wireguard-client" off a corporate network now that
+		// the vpn-client validator no longer owns the attribute.
+		if vpnTypeSet && purpose != "vpn-client" {
+			return fmt.Errorf("%q is only valid when purpose = %q or %q", "vpn_type", "vpn-client", "remote-user-vpn")
+		}
 		return nil
 	}
 
-	if vpnType == "wireguard-client" {
+	switch {
+	case !vpnTypeSet:
+		return fmt.Errorf("%q is required when purpose = %q (only %q is supported)", "vpn_type", "remote-user-vpn", "wireguard-server")
+	case !vpnTypeKnown:
+		// Interpolated: set, but not comparable until apply.
+	case vpnType == "wireguard-client":
 		return fmt.Errorf("vpn_type %q is only valid when purpose = %q", "wireguard-client", "vpn-client")
-	}
-	// Only the WireGuard server is modelled. OpenVPN/L2TP servers use a different
-	// set of controller fields that this resource does not expose, so accepting
-	// them here would produce a create the controller rejects.
-	if vpnType != "wireguard-server" {
+	case vpnType != "wireguard-server":
+		// Only the WireGuard server is modelled. OpenVPN/L2TP servers use a
+		// different set of controller fields that this resource does not expose,
+		// so accepting them here would produce a create the controller rejects.
 		return fmt.Errorf("%q is required when purpose = %q (only %q is supported)", "vpn_type", "remote-user-vpn", "wireguard-server")
 	}
+
+	// uid_vpn_type names the same thing as vpn_type from the VPN Server's side, so
+	// the two must agree: "openvpn" alongside a wireguard-server describes an
+	// object this resource cannot produce, and the controller would reject or
+	// mis-apply the contradictory payload.
+	if uidVPNType, known := str("uid_vpn_type"); known && uidVPNType != "wireguard" {
+		return fmt.Errorf("%q must be %q when vpn_type = %q (an OpenVPN server is not modelled by this resource)", "uid_vpn_type", "wireguard", "wireguard-server")
+	}
+
 	if !utils.IsRawConfigSet(raw, "subnet") {
 		return fmt.Errorf("%q (the VPN Server's own tunnel address) is required for a remote-user-vpn network", "subnet")
 	}
 	// The client address pool is either explicit or controller-allocated, never
-	// neither: with both absent the controller has nothing to hand out.
-	if !boolean("remote_vpn_dynamic_subnets_enabled") && !utils.IsRawConfigSet(raw, "remote_vpn_subnets") {
-		return fmt.Errorf("%q is required when %q is false", "remote_vpn_subnets", "remote_vpn_dynamic_subnets_enabled")
+	// neither: with both absent the controller has nothing to hand out. An
+	// interpolated toggle is skipped — which branch applies is not yet knowable.
+	if dynamic, evaluable := boolVal("remote_vpn_dynamic_subnets_enabled"); evaluable && !dynamic {
+		if !utils.IsRawConfigSet(raw, "remote_vpn_subnets") {
+			return fmt.Errorf("%q is required when %q is false", "remote_vpn_subnets", "remote_vpn_dynamic_subnets_enabled")
+		}
 	}
 	return nil
 }
@@ -1280,9 +1374,9 @@ func validateDHCPGuardingRawConfig(raw cty.Value) error {
 	if raw.IsNull() || !raw.Type().HasAttribute("dhcp_guarding") {
 		return nil
 	}
-	// dhcp_guarding is a bool, so read it from raw config directly — IsRawConfigSet
-	// is for strings/numbers/collections and would panic on a bool. Skip unless it
-	// is explicitly, known-true in config (null = omitted, unknown = interpolated).
+	// Read the bool from raw config directly rather than through IsRawConfigSet:
+	// that helper answers "is this set?", and here the question is the narrower
+	// "is it explicitly, known-true?" (null = omitted, unknown = interpolated).
 	guarding := raw.GetAttr("dhcp_guarding")
 	if guarding.IsNull() || !guarding.IsKnown() || guarding.False() {
 		return nil
@@ -1311,8 +1405,8 @@ func validateDefaultGatewayRawConfig(raw cty.Value) error {
 	if raw.IsNull() || !raw.Type().HasAttribute("dhcpd_gateway_enabled") {
 		return nil
 	}
-	// dhcpd_gateway_enabled is a bool, so read it from raw config directly
-	// (IsRawConfigSet is for strings/numbers/collections and would panic on a bool).
+	// Read the bool from raw config directly rather than through IsRawConfigSet:
+	// the rules below branch on its *value*, not on whether it is set.
 	// null = omitted (inherits), unknown = interpolated (can't validate at plan).
 	enabled := raw.GetAttr("dhcpd_gateway_enabled")
 	enabledKnown := !enabled.IsNull() && enabled.IsKnown()

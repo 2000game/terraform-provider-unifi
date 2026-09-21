@@ -156,3 +156,120 @@ func TestNetworkEnums_pass2(t *testing.T) {
 		t.Error("vpn_type \"openvpn-server\" is not modelled and should be rejected")
 	}
 }
+
+// Regression: removing vpn_type from customizeNetworkVPNClient's exclusivity list
+// left "wireguard-client" accepted on every purpose that is not remote-user-vpn.
+// Neither value belongs on a non-VPN network.
+func TestValidateRemoteUserVPNRawConfig_rejectsVPNTypeOnNonVPNPurpose(t *testing.T) {
+	for _, vpnType := range []string{"wireguard-client", "wireguard-server"} {
+		err := validateRemoteUserVPNRawConfig(cty.ObjectVal(map[string]cty.Value{
+			"purpose":  cty.StringVal("corporate"),
+			"subnet":   cty.StringVal("10.10.1.1/24"),
+			"vpn_type": cty.StringVal(vpnType),
+		}))
+		wantErr(t, err, `is only valid when purpose`)
+	}
+}
+
+// An interpolated vpn_type is set, just not knowable at plan time. The schema enum
+// still constrains it at apply, so the rule must defer rather than read it as "".
+func TestValidateRemoteUserVPNRawConfig_unknownVPNType(t *testing.T) {
+	wantOK(t, validateRemoteUserVPNRawConfig(serverRaw(map[string]cty.Value{
+		"vpn_type": cty.UnknownVal(cty.String),
+	})))
+}
+
+// Same for the dynamic-pool toggle: unknown is not false, and reading it as false
+// fails a config whose pool is legitimately controller-allocated.
+func TestValidateRemoteUserVPNRawConfig_unknownDynamicSubnets(t *testing.T) {
+	wantOK(t, validateRemoteUserVPNRawConfig(serverRaw(map[string]cty.Value{
+		"remote_vpn_subnets":                 cty.NilVal,
+		"remote_vpn_dynamic_subnets_enabled": cty.UnknownVal(cty.Bool),
+	})))
+}
+
+// A module that passes every optional argument from a variable with a `false`
+// default must not be rejected: an explicit `false` asks for nothing the purpose
+// cannot give, so it does not count as "configured for another purpose".
+func TestValidateRemoteUserVPNRawConfig_explicitFalseIsNotAServerField(t *testing.T) {
+	for _, field := range []string{
+		"remote_vpn_dynamic_subnets_enabled", "uid_vpn_masquerade_enabled", "uid_vpn_sync_public_ip",
+	} {
+		wantOK(t, validateRemoteUserVPNRawConfig(cty.ObjectVal(map[string]cty.Value{
+			"purpose": cty.StringVal("corporate"),
+			"subnet":  cty.StringVal("10.10.1.1/24"),
+			field:     cty.False,
+		})))
+	}
+}
+
+// Only the WireGuard server is modelled, so the two "which server" fields must
+// agree; uid_vpn_type = "openvpn" alongside vpn_type = "wireguard-server"
+// describes an object this resource cannot produce.
+func TestValidateRemoteUserVPNRawConfig_uidVPNTypeMustMatch(t *testing.T) {
+	wantErr(t, validateRemoteUserVPNRawConfig(serverRaw(map[string]cty.Value{
+		"uid_vpn_type": cty.StringVal("openvpn"),
+	})), `"uid_vpn_type" must be "wireguard"`)
+
+	wantOK(t, validateRemoteUserVPNRawConfig(serverRaw(map[string]cty.Value{
+		"uid_vpn_type": cty.StringVal("wireguard"),
+	})))
+}
+
+// A VPN Server needs its own keypair, and the fields that carry one must not be
+// Optional-without-Computed dead ends: uid_vpn_max_connection_time_seconds and
+// uid_vpn_default_dns_suffix both carry `omitempty` in go-unifi, so without
+// Computed a removed attribute never reaches the controller and the diff never
+// converges.
+func TestNetworkSchema_uidVPNOptionalsAreComputed(t *testing.T) {
+	s := ResourceNetwork().Schema
+	for _, name := range []string{"uid_vpn_max_connection_time_seconds", "uid_vpn_default_dns_suffix"} {
+		if !s[name].Computed {
+			t.Errorf("%q must be Computed: its go-unifi field is omitempty, so an unset value is dropped from the payload and the controller's old value is read back forever", name)
+		}
+	}
+}
+
+// A wireguard-server network had no way to obtain a private key: the mint was
+// keyed on "wireguard-client" only, while x_wireguard_private_key was rejected
+// outright on any purpose but vpn-client. Either way the create carried no key.
+func TestNeedsGeneratedWireguardKey(t *testing.T) {
+	for _, tc := range []struct {
+		vpnType, key string
+		want         bool
+	}{
+		{"wireguard-server", "", true},
+		{"wireguard-client", "", true},
+		{"wireguard-server", "existing", false},
+		{"wireguard-client", "existing", false},
+		{"", "", false},
+	} {
+		if got := needsGeneratedWireguardKey(tc.vpnType, tc.key); got != tc.want {
+			t.Errorf("needsGeneratedWireguardKey(%q, %q) = %v, want %v", tc.vpnType, tc.key, got, tc.want)
+		}
+	}
+}
+
+// The gateway's own keypair and egress WAN belong to both WireGuard purposes, and
+// to neither of the others.
+func TestValidateWireguardFieldPurposes(t *testing.T) {
+	raw := func(field string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{field: cty.StringVal("wan")})
+	}
+	for _, field := range []string{"wireguard_interface", "x_wireguard_private_key"} {
+		wantOK(t, validateWireguardFieldPurposes(raw(field), "vpn-client"))
+		wantOK(t, validateWireguardFieldPurposes(raw(field), "remote-user-vpn"))
+		wantErr(t, validateWireguardFieldPurposes(raw(field), "corporate"),
+			`"`+field+`" is only valid when purpose = "vpn-client" or "remote-user-vpn"`)
+	}
+}
+
+// Every rule in the validator is keyed on purpose, so an interpolated purpose
+// makes none of them decidable — including the widened vpn_type exclusivity.
+func TestValidateRemoteUserVPNRawConfig_unknownPurpose(t *testing.T) {
+	wantOK(t, validateRemoteUserVPNRawConfig(cty.ObjectVal(map[string]cty.Value{
+		"purpose":  cty.UnknownVal(cty.String),
+		"vpn_type": cty.StringVal("wireguard-server"),
+		"subnet":   cty.StringVal("192.168.3.1/24"),
+	})))
+}

@@ -3,9 +3,14 @@ package utils
 import "github.com/hashicorp/go-cty/cty"
 
 // IsRawConfigSet reports whether attribute name is set in the raw config: non-null,
-// and for a known value non-empty (string), non-zero (number), or non-empty
-// (collection). An unknown/interpolated value (e.g. var.x) counts as set, so it
-// is not mistaken for unset at plan time.
+// and for a known value non-empty (string), non-zero (number), non-empty
+// (collection), or any bool — including an explicit false, which unlike "" or 0 is
+// distinguishable from absence here. An unknown/interpolated value (e.g. var.x)
+// counts as set, so it is not mistaken for unset at plan time.
+//
+// Note this answers "did the user write this?", not "does this ask for anything?".
+// A caller rejecting a field as inapplicable to the resource's purpose usually
+// wants the latter, and should treat an explicit false as harmless.
 func IsRawConfigSet(raw cty.Value, name string) bool {
 	// A null raw config (e.g. on destroy, or in a unit test that builds
 	// ResourceData without a config block) is known-but-null: HasAttribute still
